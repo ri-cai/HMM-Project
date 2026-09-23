@@ -18,6 +18,10 @@ df["Date"] = pd.to_datetime(df["Date"], dayfirst=True)
 if "Vol." not in df.columns:
     df["Vol."] = df["volume"]
 
+# LOOK-AHEAD FIX 1: enforce chronological order before any rolling, shift or cummax feature is built.
+# Investing.com exports newest-first by default; left unsorted, every feature below runs backwards in time.
+df = df.sort_values("Date").reset_index(drop=True)
+
 # Features engineering for HMM and RF
 df["rtn"] = df["Price"].pct_change(fill_method=None)
 df["mmt"] = df["Price"] - df["Price"].shift(4)
@@ -67,25 +71,31 @@ hmm_feature = ["rtn", "log_r", "vlt", "ma_s", "drawdown", "priceZ", "rsi", "mmt"
 all_features = ["log_r", "rtn", "mmt", "ma_c", "log_r", "vlt", "ma_s", "priceZ", "drawdown", "rsi", "Volume", "Rel_Volume", "pv_ratio", "kurt", "skew"]
 df = df.dropna(subset=all_features) 
 
-# Standardises HMM features to remove weighting bias, then compressing features into "principle components" (to capture most relevence)
+# LOOK-AHEAD FIX 2: the scaler and PCA were previously fitted on the whole series, so every window's
+# features were normalised using future data. They are now refitted inside each rolling window instead.
 from sklearn.decomposition import PCA
-scaler_hmm_features = StandardScaler()
-hmm_features = scaler_hmm_features.fit_transform(df[hmm_feature])
-pca = PCA(n_components=3)
-hmm_features = pca.fit_transform(hmm_features)
+hmm_raw = df[hmm_feature].values
 n_components = 2
 
 # Setting up the rolling HMM fitting
 import random
+random.seed(42)  # FIX 10: fixed seed so every run is reproducible and old vs new can be compared
 random_seeds = random.sample(range(1, 100001), 15)
 hmm_window = 504
 
 # Begins the fitting in the initial window (Unsupervised Learning)
 from hmmlearn.hmm import GaussianHMM
 def compute_hmm_for_index(i):
-    X_window = hmm_features[i - hmm_window: i]
+    # Standardises HMM features to remove weighting bias, then compresses into principal components,
+    # fitted on this window's past data only (imported locally, as StandardScaler is re-imported later in this function)
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    raw_window = hmm_raw[i - hmm_window: i]
+    scaler_w = StandardScaler().fit(raw_window)
+    pca_w = PCA(n_components=3).fit(scaler_w.transform(raw_window))
+    X_window = pca_w.transform(scaler_w.transform(raw_window))
     best_score = float('-inf')
-    best_model = None
+    best_seed = None
 
     # Cross-validation (only on windows to ensure temporal order)
     n_folds = 4
@@ -119,14 +129,24 @@ def compute_hmm_for_index(i):
             avg_val_score = np.mean(fold_scores)
             if avg_val_score > best_score:
                 best_score = avg_val_score
-                best_model = model
                 best_seed = seed
 
-    if best_model is None:
+    if best_seed is None:
+        return None
+
+    # FIX 5: refit the chosen seed on the full window. Previously the model kept was whichever fold model
+    # was fitted last: trained on only the first 80% of the window, or left over from another seed if a fit failed
+    try:
+        best_model = GaussianHMM(n_components=2, covariance_type="diag", n_iter=200, random_state=best_seed)
+        best_model.fit(X_window)
+    except Exception:
         return None
     
     # Viterbi algo
     window_states = best_model.predict(X_window)
+    unique_states = np.unique(window_states)
+    if len(unique_states) < 2:
+        return None
 
     # Pull features for labeling
     drawdown_window = df["drawdown"].iloc[i - hmm_window: i].values
@@ -153,44 +173,38 @@ def compute_hmm_for_index(i):
         mean_mmt = state_data["mmt"].mean()
         state_metrics.append([mean_vlt, abs(mean_drawdown), mean_Rel_Volume, mean_mmt])
 
-    # Scaling features used for labelling
-    from sklearn.preprocessing import StandardScaler
-    scaler = StandardScaler()
-    state_metrics_scaled = scaler.fit_transform(state_metrics)
-
-    # KMeans clustering based on scaled features
-    from sklearn.cluster import KMeans
-    kmeans = KMeans(n_clusters=2, random_state=seed, n_init=200)
-    cluster_labels = kmeans.fit_predict(state_metrics_scaled)
-
-    # Labels them based off feature scoring
+    # FIX 7: the clustering step grouped two state vectors into two clusters, which always puts each state in its own
+    # cluster, so it never changed the labels. Replaced with the identical direct comparison. This also removes a
+    # crash when the HMM decodes only one state in a window: that day is now skipped (see the check above)
     inflation_scores = [m[0] - m[1] for m in state_metrics]
-    cluster_inflation_scores = [
-        np.mean([inflation_scores[j] for j in range(len(cluster_labels)) if cluster_labels[j] == k])
-        for k in range(2)
-    ]
-    inflationary_cluster = np.argmax(cluster_inflation_scores)
-
+    inflationary_state = unique_states[int(np.argmax(inflation_scores))]
     regime_names = {
-        state: "Inflationary" if cluster_labels[idx] == inflationary_cluster else "Deflationary"
-        for idx, state in enumerate(np.unique(window_states))
+        state: "Inflationary" if state == inflationary_state else "Deflationary"
+        for state in unique_states
     }
 
     # Determine current state
     full_state_path = best_model.predict(X_window)
     state_today = pd.Series(full_state_path[-5:]).mode()[0]
-    x_today = hmm_features[i].reshape(1, -1)
+    x_today = pca_w.transform(scaler_w.transform(hmm_raw[i].reshape(1, -1)))
     regime_label_today = regime_names.get(state_today, "Unknown")
-    state_prob_today = best_model.predict_proba(x_today)[0]
 
+    # FIX 6: state probability from the forward pass over the window plus today. Previously it was computed on
+    # today's observation alone, which ignores the transition matrix and all history
+    state_prob_today = best_model.predict_proba(np.vstack([X_window, x_today]))[-1]
+
+    # FIX 8: HMM state numbers are arbitrary and can swap between refits, so a raw state number meant different
+    # things on different days. Features are now relative to the Inflationary state: H_S = 1 if today's state is
+    # Inflationary, state_0_prob = probability of the Inflationary state, state_1_prob = of the Deflationary state
+    infl_idx = int(inflationary_state)
     result_entry = {
         'original_index': df.index[i],
-        'H_S': state_today,
+        'H_S': int(state_today == inflationary_state),
         'Regime_Label': regime_label_today,
         'Chosen_Seed': best_seed
     }
-    for comp in range(2):
-        result_entry[f'state_{comp}_prob'] = state_prob_today[comp]
+    result_entry['state_0_prob'] = state_prob_today[infl_idx]
+    result_entry['state_1_prob'] = state_prob_today[1 - infl_idx]
 
     return result_entry
 
@@ -227,7 +241,10 @@ rf_features_to_scale = [feat for feat in rf_features if feat != "H_S"]
 
 # Seeds to try for each retrain
 rf_seeds = random.sample(range(1, 100001), 15)
-start_idx = int(len(df_rolling) * 0.2)
+# LOOK-AHEAD FIX 3: fixed burn-in instead of 20% of the total sample length. A fraction of the full length
+# means the first prediction date and every retrain date depended on how much future data existed.
+rf_burn_in = 252
+start_idx = rf_burn_in
 rolling_predictions = []
 rolling_true = df_rolling["Next_Regime"].iloc[start_idx:len(df_rolling) - 1].tolist()
 
@@ -253,25 +270,33 @@ for current_day in range(start_idx, len(df_rolling) - 1):
         scaler = StandardScaler()
         train_x[rf_features_to_scale] = scaler.fit_transform(train_x[rf_features_to_scale])
 
-        best_model = None
+        # FIX 9: seed chosen on a chronological validation split (the most recent 20% of the training data), then
+        # refitted on all of it. Previously it was chosen on training accuracy, which rewards memorising the data
+        n_val = max(1, int(len(train_x) * 0.2))
+        fit_x, val_x = train_x.iloc[:-n_val], train_x.iloc[-n_val:]
+        fit_y, val_y = train_y.iloc[:-n_val], train_y.iloc[-n_val:]
+
         best_score = -float("inf")
         best_seed_local = None
 
         for seed in rf_seeds:
             try:
                 rf = RandomForestClassifier(random_state=seed, n_estimators=200, max_depth=10, min_samples_leaf=5, min_samples_split=15, n_jobs=2)
-                rf.fit(train_x, train_y)
-                score = rf.score(train_x, train_y)
+                rf.fit(fit_x, fit_y)
+                score = rf.score(val_x, val_y)
 
                 if score > best_score:
                     best_score = score
-                    best_model = rf
                     best_seed_local = seed
 
             except Exception:
                 continue
 
-        rfmodel = best_model
+        if best_seed_local is None:
+            rfmodel = None
+        else:
+            rfmodel = RandomForestClassifier(random_state=best_seed_local, n_estimators=200, max_depth=10, min_samples_leaf=5, min_samples_split=15, n_jobs=2)
+            rfmodel.fit(train_x, train_y)
         best_rf_seed = best_seed_local
         best_rf_score = best_score
         last_trained_day = current_day
@@ -292,6 +317,15 @@ filtered_pairs = [(t, p) for t, p in zip(rolling_true, rolling_predictions) if p
 if filtered_pairs:
     filtered_true, filtered_predictions = zip(*filtered_pairs)
     print(classification_report(filtered_true, filtered_predictions))
+
+# Naive benchmark for the accuracy above: predict that tomorrow's regime equals today's. The regime label is very
+# persistent, so this baseline is high, and model accuracy only means something relative to it
+persist_labels = df_rolling["Regime_Label"].iloc[start_idx:len(df_rolling) - 1].tolist()
+persist_pairs = [(t, q) for t, q, p in zip(rolling_true, persist_labels, rolling_predictions) if p is not None]
+if persist_pairs:
+    rf_acc = np.mean([t == p for t, p in filtered_pairs])
+    persist_acc = np.mean([t == q for t, q in persist_pairs])
+    print(f"RF accuracy: {rf_acc:.2%} | Persistence baseline (tomorrow = today): {persist_acc:.2%}")
 
 # Final best RF info
 print(f"Seed used by the final selected RF model: {best_rf_seed} | Validation Accuracy: {best_rf_score:.2%}")
@@ -321,20 +355,24 @@ df_rolling["Position"] = df_rolling["Rolling_Predicted_Regime"].map({
 # Defines costs
 transaction_cost = 0.001
 
-# Calculate position changes from previous day
-df_rolling["Prev_Position"] = df_rolling["Position"].shift(1).fillna(0)
+# LOOK-AHEAD FIX 4: a signal computed from day t's close is filled at day t+1's close, so it first earns day t+2's return.
+# Previously it earned day t+1's return, which assumed filling at the same close the signal was computed from.
+df_rolling["Held_Position"] = df_rolling["Position"].shift(2)
 
-# Costs implimented
+# Calculate position changes from previous day
+df_rolling["Prev_Position"] = df_rolling["Held_Position"].shift(1).fillna(0)
+
+# Costs implimented, charged on the day the held position actually changes
 df_rolling["Transaction_Cost"] = np.where(
-    ((df_rolling["Prev_Position"] == 1) & (df_rolling["Position"] == 0)) |
-    ((df_rolling["Prev_Position"] == 0) & (df_rolling["Position"] == 1)),
+    ((df_rolling["Prev_Position"] == 1) & (df_rolling["Held_Position"] == 0)) |
+    ((df_rolling["Prev_Position"] == 0) & (df_rolling["Held_Position"] == 1)),
     transaction_cost,
     0.0
 )
 
 # Compute Strategy Return
 df_rolling["Strategy_Return"] = (
-    df_rolling["Position"].shift(1) * df_rolling["rtn"]
+    df_rolling["Held_Position"] * df_rolling["rtn"]
     - df_rolling["Transaction_Cost"]
 )
 
