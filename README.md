@@ -8,7 +8,7 @@ The idea is that markets tend to switch between two broad states — one where t
 Engineer a bunch of technical features from daily price data (returns, volatility, momentum, RSI, relative volume, etc.)
 Compress the key ones down to 3 components with PCA
 Fit a Gaussian HMM on a rolling 504-day window to classify each day into one of two hidden states
-Label those states as "Inflationary" or "Deflationary" using KMeans on per-state averages of volatility, drawdown, momentum, and volume
+Label those states as "Inflationary" or "Deflationary" using a score computed based off volatility and drawdown (suggest via FIA)
 Train a Random Forest (retrained every ~126 days) to predict tomorrow's regime using the HMM output + technical indicators
 Go long when the model predicts inflationary, sit in cash when it predicts deflationary
 
